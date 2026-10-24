@@ -1,0 +1,199 @@
+import math
+
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from std_msgs.msg import Float64MultiArray
+
+
+# Waypoint jalur kiri. Robot mulai relatif di (0, 0), menghadap +x.
+TRACK_KIRI = [
+    (0.60, 2.38), (2.42, 2.38), (2.42, 3.04), (3.66, 3.04),
+    (3.66, 0.79), (7.91, 0.79), (7.91, 5.86), (7.68, 6.62),
+    (7.11, 7.16), (6.36, 7.35), (5.61, 7.15), (5.06, 6.61),
+    (4.84, 5.86), (4.84, 4.27), (3.94, 4.27), (3.94, 6.78),
+    (3.00, 6.78), (1.50, 7.54), (0.28, 7.54), (0.28, 4.80),
+]
+
+# Jalur kanan adalah cerminan jalur kiri.
+TRACK_KANAN = [(x, round(-0.1188 - y, 2)) for x, y in TRACK_KIRI]
+
+
+def normalize_angle(angle):
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+class UtsNode(Node):
+    def __init__(self):
+        super().__init__('uts_node')
+
+        self.declare_parameter('track', 'kiri')
+        # Harus sama dengan Xacro:
+        # wheel_radius=0.03, base_width=0.10,
+        # wheel_length=0.01 -> separation=0.11.
+        self.declare_parameter('wheel_radius', 0.03)
+        self.declare_parameter('wheel_separation', 0.11)
+        self.declare_parameter('v_max', 0.15)
+        self.declare_parameter('w_max', 0.80)
+        self.declare_parameter('acc_lin', 0.30)
+        self.declare_parameter('acc_ang', 1.20)
+        self.declare_parameter('k_v', 1.0)
+        self.declare_parameter('k_theta', 1.6)
+        self.declare_parameter('turn_in_place', 0.60)
+        self.declare_parameter('wp_tolerance', 0.08)
+        self.declare_parameter('goal_tolerance', 0.06)
+
+        p = self.get_parameter
+        track = str(p('track').value).lower()
+        self.r = float(p('wheel_radius').value)
+        self.s = float(p('wheel_separation').value)
+        self.v_max = float(p('v_max').value)
+        self.w_max = float(p('w_max').value)
+        self.acc_lin = float(p('acc_lin').value)
+        self.acc_ang = float(p('acc_ang').value)
+        self.k_v = float(p('k_v').value)
+        self.k_theta = float(p('k_theta').value)
+        self.turn_in_place = float(p('turn_in_place').value)
+        self.wp_tol = float(p('wp_tolerance').value)
+        self.goal_tol = float(p('goal_tolerance').value)
+
+        self.track = 'kanan' if track == 'kanan' else 'kiri'
+        self.waypoints = TRACK_KANAN if self.track == 'kanan' else TRACK_KIRI
+
+        # Estimasi pose dari kecepatan roda.
+        self.x = 0.0
+        self.y = 0.0
+        self.theta = 0.0
+        self.last_odom_time = None
+        self.sum_l = 0.0
+        self.sum_r = 0.0
+        self.n_samples = 0
+        self.got_wheel_data = False
+
+        self.wp_index = 0
+        self.started = False
+        self.finished = False
+        self.start_time = None
+        self.cmd_v = 0.0
+        self.cmd_w = 0.0
+        self.dt_ctrl = 0.05
+
+        self.create_subscription(
+            Float64MultiArray, '/wheel/speed', self.wheel_callback, 10)
+        self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.timer = self.create_timer(self.dt_ctrl, self.control_loop)
+
+        self.get_logger().info(
+            f'Track {self.track.upper()} | r={self.r:.2f} m | s={self.s:.2f} m | '
+            'tanpa LiDAR | menunggu /wheel/speed')
+
+    def wheel_callback(self, msg):
+        if len(msg.data) < 2:
+            return
+        self.sum_l += float(msg.data[0])
+        self.sum_r += float(msg.data[1])
+        self.n_samples += 1
+        self.got_wheel_data = True
+
+        now = self.get_clock().now()
+        if self.last_odom_time is None:
+            self.last_odom_time = now
+            self.sum_l = self.sum_r = 0.0
+            self.n_samples = 0
+            return
+
+        dt = (now - self.last_odom_time).nanoseconds * 1e-9
+        if dt <= 0.0:
+            return
+        phi_l = self.sum_l / self.n_samples
+        phi_r = self.sum_r / self.n_samples
+        self.sum_l = self.sum_r = 0.0
+        self.n_samples = 0
+        self.last_odom_time = now
+        if dt > 0.5:
+            return
+
+        v = self.r * (phi_l + phi_r) / 2.0
+        omega = self.r * (phi_r - phi_l) / self.s
+        theta_mid = self.theta + omega * dt / 2.0
+        self.x += v * math.cos(theta_mid) * dt
+        self.y += v * math.sin(theta_mid) * dt
+        self.theta = normalize_angle(self.theta + omega * dt)
+
+    def control_loop(self):
+        if self.finished:
+            self.publish_cmd(0.0, 0.0, False)
+            return
+        if not self.got_wheel_data:
+            self.publish_cmd(0.0, 0.0, False)
+            return
+        if not self.started:
+            self.started = True
+            self.start_time = self.get_clock().now()
+            self.get_logger().info('START!')
+
+        gx, gy = self.waypoints[self.wp_index]
+        dx, dy = gx - self.x, gy - self.y
+        distance = math.hypot(dx, dy)
+        tolerance = self.goal_tol if self.wp_index == len(self.waypoints) - 1 else self.wp_tol
+
+        if distance <= tolerance:
+            if self.wp_index == len(self.waypoints) - 1:
+                self.finish()
+                return
+            self.wp_index += 1
+            gx, gy = self.waypoints[self.wp_index]
+            dx, dy = gx - self.x, gy - self.y
+            distance = math.hypot(dx, dy)
+
+        desired = math.atan2(dy, dx)
+        error = normalize_angle(desired - self.theta)
+        omega = clamp(self.k_theta * error, -self.w_max, self.w_max)
+        if abs(error) > self.turn_in_place:
+            linear = 0.0
+        else:
+            linear = min(self.k_v * distance, self.v_max) * max(0.0, math.cos(error))
+        self.publish_cmd(linear, omega)
+
+    def publish_cmd(self, linear, angular, smooth=True):
+        if smooth:
+            dv = self.acc_lin * self.dt_ctrl
+            dw = self.acc_ang * self.dt_ctrl
+            linear = clamp(linear, self.cmd_v - dv, self.cmd_v + dv)
+            angular = clamp(angular, self.cmd_w - dw, self.cmd_w + dw)
+        self.cmd_v, self.cmd_w = linear, angular
+        msg = Twist()
+        msg.linear.x = float(linear)
+        msg.angular.z = float(angular)
+        self.cmd_pub.publish(msg)
+
+    def finish(self):
+        self.finished = True
+        self.publish_cmd(0.0, 0.0, False)
+        elapsed = (self.get_clock().now() - self.start_time).nanoseconds * 1e-9
+        self.get_logger().info(
+            f'FINISH track {self.track.upper()} | waktu {elapsed:.2f} s | '
+            f'posisi estimasi ({self.x:.2f}, {self.y:.2f})')
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = UtsNode()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        node.publish_cmd(0.0, 0.0, False)
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
